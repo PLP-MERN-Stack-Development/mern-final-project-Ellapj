@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job Hub Real-Time Chat with Persistence</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load React and ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Load Babel for JSX support -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Load Socket.io Client -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script>
+    
+    <!-- Load Lucide Icons (FIXED: Using simple script load to avoid SyntaxError) -->
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, addDoc, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        // Enable Firebase Debug Logging
+        setLogLevel('debug');
+        window.firebase = { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, onSnapshot, addDoc, serverTimestamp };
+    </script>
+    
+    <style>
+        /* Custom styles */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f9fafb;
+        }
+        #root {
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start; 
+        }
+        /* Ensure the icons render correctly */
+        [data-lucide] {
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+        const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, onSnapshot, addDoc, serverTimestamp } = window.firebase;
+        
+        // --- Icon Component Replacement (from lucide-react to native lucide.js) ---
+        const Icon = ({ name, className = "w-5 h-5", style = {}, onClick }) => {
+            const containerRef = useRef(null);
+            useEffect(() => {
+                if (containerRef.current) {
+                    containerRef.current.innerHTML = ''; // Clear existing icon
+                    // Access the global lucide object
+                    if (window.lucide && window.lucide.icons && window.lucide.icons[name]) {
+                        const iconHtml = window.lucide.icons[name].toSvg({
+                            class: className,
+                            style: style
+                        });
+                        containerRef.current.innerHTML = iconHtml;
+                    }
+                }
+            }, [name, className, style]);
+            
+            return <span ref={containerRef} className={className} onClick={onClick}></span>;
+        };
+
+        const MessageSquare = (props) => <Icon name="message-square" {...props} />;
+        const Send = (props) => <Icon name="send" {...props} />;
+        const Zap = (props) => <Icon name="zap" {...props} />;
+        const Wifi = (props) => <Icon name="wifi" {...props} />;
+        const Users = (props) => <Icon name="users" {...props} />;
+        const UserPlus = (props) => <Icon name="user-plus" {...props} />;
+        const Database = (props) => <Icon name="database" {...props} />;
+        const RotateCw = (props) => <Icon name="rotate-cw" {...props} />;
+
+        // --- Socket.io Client Connection (embedded from client/socket.js) ---
+        // The URL of our Node.js server
+        const SERVER_URL = 'http://localhost:3001';
+        
+        // Set up Socket.io client
+        const socket = io(SERVER_URL, { autoConnect: false });
+        
+        // Basic connection status listeners (for logging purposes)
+        socket.on('connect', () => {
+            console.log(`[Client] Connected to server! Socket ID: ${socket.id}`);
+        });
+        
+        socket.on('disconnect', (reason) => {
+            console.warn(`[Client] Disconnected from server: ${reason}`);
+        });
+
+        // --- Utility functions ---
+        const getCurrentTimestamp = (date) => (date ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+        const generateId = () => Math.random().toString(36).substring(2, 9);
+        const getUserId = (auth) => auth?.currentUser?.uid || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : generateId());
+
+        // --- Global variables provided by the Canvas environment ---
+        // Added safe access for global variables
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+
+        const App = () => {
+            // --- Authentication and Firebase State ---
+            const [db, setDb] = useState(null);
+            const [isAuthReady, setIsAuthReady] = useState(false);
+            const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+
+            // --- Chat State ---
+            const [isAuthenticated, setIsAuthenticated] = useState(false);
+            const [username, setUsername] = useState('');
+            const [messages, setMessages] = useState([]);
+            const [inputMessage, setInputMessage] = useState('');
+            const [isConnected, setIsConnected] = useState(false);
+            const [activeUsers, setActiveUsers] = useState([]); 
+
+            const messagesEndRef = useRef(null);
+            // FIX: Simplified the collection path to 3 segments (C/D/C) to resolve the Firebase Invalid collection reference error.
+            const chatCollectionPath = `/artifacts/${appId}/chat_messages`;
+
+
+            // --- 1. Firebase Initialization and Authentication (Task 4) ---
+            useEffect(() => {
+                if (!Object.keys(firebaseConfig).length) {
+                    console.error("Firebase configuration is missing.");
+                    setIsAuthReady(true);
+                    return;
+                }
+
+                try {
+                    const app = initializeApp(firebaseConfig);
+                    const firestore = getFirestore(app);
+                    const firebaseAuth = getAuth(app);
+                    
+                    setDb(firestore);
+
+                    const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (user) => {
+                        if (user) {
+                            // User is already signed in
+                        } else if (initialAuthToken) {
+                            // Use custom token if available
+                            await signInWithCustomToken(firebaseAuth, initialAuthToken).catch(e => {
+                                console.error("Error signing in with custom token:", e);
+                                signInAnonymously(firebaseAuth); // Fallback to anonymous
+                            });
+                        } else {
+                            // Fallback to anonymous sign-in
+                            await signInAnonymously(firebaseAuth).catch(e => {
+                                console.error("Error signing in anonymously:", e);
+                            });
+                        }
+                        setIsAuthReady(true);
+                    });
+
+                    return () => unsubscribeAuth();
+                } catch (e) {
+                    console.error("Firebase initialization failed:", e);
+                    setIsAuthReady(true);
+                }
+            }, []);
+
+            // --- 2. Load Persistent Chat History (Task 4) ---
+            useEffect(() => {
+                if (!isAuthReady || !db) return;
+
+                const collectionRef = collection(db, chatCollectionPath);
+                
+                const unsubscribeFirestore = onSnapshot(collectionRef, (snapshot) => {
+                    // Sort history client-side by createdAt, as orderBy is avoided
+                    const history = snapshot.docs.map(doc => {
+                        const data = doc.data();
+                        return {
+                            id: doc.id,
+                            user: data.user,
+                            text: data.text,
+                            createdAt: data.createdAt ? data.createdAt.toMillis() : 0, // for client-side sorting
+                            timestamp: data.createdAt ? getCurrentTimestamp(data.createdAt.toDate()) : getCurrentTimestamp(),
+                            type: data.type || 'user'
+                        };
+                    }).sort((a, b) => a.createdAt - b.createdAt); // Sort by timestamp
+
+                    setMessages([
+                        { id: generateId(), user: 'System', text: 'Welcome to the Global Job Hub Chat Room. Enter a username to begin.', timestamp: getCurrentTimestamp(), type: 'system' },
+                        ...history
+                    ]);
+                    setIsLoadingHistory(false);
+                    console.log(`[Firestore] Loaded ${history.length} persistent messages.`);
+                }, (error) => {
+                    console.error("Error listening to Firestore:", error);
+                    setIsLoadingHistory(false);
+                });
+
+                return () => unsubscribeFirestore();
+            }, [isAuthReady, db]); 
+
+            // --- 3. Socket Listeners (Task 1, 2, 3) ---
+            useEffect(() => {
+                if (!isAuthenticated) return;
+
+                const onConnect = () => {
+                    setIsConnected(true);
+                    console.log('--- Socket Connected ---');
+                    socket.emit('user_register', { username });
+                };
+
+                const onDisconnect = (reason) => {
+                    setIsConnected(false);
+                    console.warn('--- Socket Disconnected ---', reason);
+                };
+                
+                // Only listen for transient system events that Firestore doesn't handle
+                const onReceiveMessage = (message) => {
+                    if (message.type === 'system') {
+                        setMessages(prev => [...prev, {...message, timestamp: getCurrentTimestamp()}]);
+                    }
+                };
+                
+                const onUserListUpdate = (users) => {
+                    setActiveUsers(users);
+                };
+
+                socket.on('connect', onConnect);
+                socket.on('disconnect', onDisconnect);
+                socket.on('chat_message', onReceiveMessage);
+                socket.on('user_list_update', onUserListUpdate); 
+                
+                return () => {
+                    socket.off('connect', onConnect);
+                    socket.off('disconnect', onDisconnect);
+                    socket.off('chat_message', onReceiveMessage);
+                    socket.off('user_list_update', onUserListUpdate);
+                };
+            }, [isAuthenticated, username]); 
+
+            // Scroll to the bottom whenever messages change
+            useEffect(() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+            }, [messages]);
+
+
+            // --- Handlers ---
+            const handleSendMessage = async (e) => {
+                e.preventDefault();
+                if (!inputMessage.trim() || !isAuthenticated || !isConnected || !db) return;
+
+                const messageText = inputMessage.trim();
+                const messageData = {
+                    user: username,
+                    text: messageText,
+                    createdAt: serverTimestamp(), 
+                    type: 'user'
+                };
+
+                // 4. Save message to Firestore (Task 4)
+                try {
+                    await addDoc(collection(db, chatCollectionPath), messageData);
+                } catch (e) {
+                    console.error("Error adding document: ", e);
+                    // Fallback: send transient message if persistence fails
+                    const tempMessage = { user: username, text: messageText, type: 'user' };
+                    setMessages(prev => [...prev, {...tempMessage, timestamp: getCurrentTimestamp()}]);
+                }
+
+                setInputMessage('');
+            };
+
+            const handleSetUsername = (e) => {
+                e.preventDefault();
+                if (username.trim().length > 2 && isAuthReady) {
+                    setIsAuthenticated(true);
+                    socket.connect(); 
+                }
+            };
+
+            // --- Message Rendering Component ---
+            
+            const MessageBubble = ({ message, isSelf }) => {
+                if (message.type === 'system') {
+                    return (
+                        <div className="flex justify-center my-3">
+                            <span className="text-xs text-gray-500 bg-gray-200 px-3 py-1 rounded-full italic shadow-inner">
+                                {message.text}
+                            </span>
+                        </div>
+                    );
+                }
+
+                return (
+                    <div className={`flex mb-4 ${isSelf ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`max-w-xs lg:max-w-md p-3 rounded-xl shadow-lg transition-all duration-300 ${
+                            isSelf 
+                                ? 'bg-blue-600 text-white rounded-br-none' 
+                                : 'bg-gray-100 text-gray-800 rounded-tl-none'
+                        }`}>
+                            <div className="flex justify-between items-baseline mb-1">
+                                <span className={`font-semibold text-sm ${isSelf ? 'text-blue-200' : 'text-gray-900'}`}>
+                                    {message.user}
+                                </span>
+                            </div>
+                            <p className="text-sm break-words leading-relaxed">
+                                {message.text}
+                            </p>
+                            <div className="text-right mt-1">
+                                <span className={`text-xs ${isSelf ? 'text-blue-300' : 'text-gray-500'}`}>
+                                    {message.timestamp}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            if (!isAuthenticated) {
+                // Authentication Form (Login Screen)
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-4 bg-gray-50">
+                        <div className="w-full max-w-sm bg-white p-8 rounded-xl shadow-2xl border border-gray-100">
+                            <div className="text-center">
+                                <MessageSquare className="h-10 w-10 text-blue-600 mx-auto" />
+                                <h2 className="mt-4 text-2xl font-bold text-gray-900">
+                                    Join the Job Hub Chat
+                                </h2>
+                                <p className="mt-2 text-sm text-gray-500">
+                                    Set a username to enter the global room.
+                                </p>
+                            </div>
+                            <form className="mt-6 space-y-4" onSubmit={handleSetUsername}>
+                                <div>
+                                    <label htmlFor="username" className="sr-only">Username</label>
+                                    <input
+                                        id="username"
+                                        name="username"
+                                        type="text"
+                                        required
+                                        value={username}
+                                        onChange={(e) => setUsername(e.target.value)}
+                                        className="appearance-none relative block w-full px-4 py-3 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition duration-150"
+                                        placeholder="Choose a Username (e.g., JobSeeker77)"
+                                        disabled={!isAuthReady}
+                                    />
+                                </div>
+                                <button
+                                    type="submit"
+                                    className="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-medium rounded-lg text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition duration-150 ease-in-out shadow-md disabled:opacity-50"
+                                    disabled={!isAuthReady || username.trim().length <= 2}
+                                >
+                                    {isAuthReady ? 'Enter Chat Room' : 'Loading Auth...'}
+                                </button>
+                                <div className="text-xs text-center text-gray-400 mt-4 flex items-center justify-center space-x-1">
+                                    {isAuthReady ? <Database className='w-3 h-3 text-green-500'/> : <RotateCw className='w-3 h-3 animate-spin text-yellow-500'/>}
+                                    <span>{isAuthReady ? 'Database Ready' : 'Initializing components...'}</span>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                );
+            }
+
+            // --- Main Chat UI ---
+            return (
+                <div className="min-h-screen bg-gray-50 flex flex-col items-center p-4 sm:p-6 font-inter">
+                    <div className="w-full max-w-6xl bg-white rounded-xl shadow-2xl flex h-[90vh] border border-gray-100">
+                        
+                        {/* -------------------- 1. Active Users Sidebar (Task 3) -------------------- */}
+                        <aside className="hidden md:flex flex-col w-64 border-r border-gray-200 bg-gray-50 p-4">
+                            <h2 className="text-lg font-bold text-gray-900 flex items-center space-x-2 pb-4 border-b border-gray-200">
+                                <Users className="h-5 w-5 text-blue-600" />
+                                <span>Active Users</span>
+                                <span className="text-xs bg-blue-600 text-white rounded-full px-2 py-0.5 ml-auto">
+                                    {activeUsers.length}
+                                </span>
+                            </h2>
+                            <div className="mt-4 space-y-2 overflow-y-auto flex-1">
+                                {activeUsers.length > 0 ? (
+                                    activeUsers.map((user) => (
+                                        <div key={user} className={`flex items-center space-x-3 p-2 rounded-lg transition duration-150 ${user === username ? 'bg-blue-100 font-semibold' : 'hover:bg-gray-100'}`}>
+                                            <div className={`w-3 h-3 rounded-full ${user === username ? 'bg-blue-500' : 'bg-green-500'} flex-shrink-0`}></div>
+                                            <span className="text-sm truncate">{user}</span>
+                                            {user === username && (
+                                                <span className="text-xs text-blue-600 ml-auto">(You)</span>
+                                            )}
+                                        </div>
+                                    ))
+                                ) : (
+                                    <div className="text-sm text-gray-500 text-center mt-8">
+                                        <UserPlus className="h-6 w-6 mx-auto mb-2 text-gray-400" />
+                                        No other users online.
+                                    </div>
+                                )}
+                            </div>
+                        </aside>
+                        
+                        {/* -------------------- 2. Chat Window (Main Content) -------------------- */}
+                        <div className="flex-1 flex flex-col">
+                            {/* Header */}
+                            <header className="flex items-center justify-between p-4 border-b border-gray-200 bg-white rounded-t-xl md:rounded-tl-none sticky top-0 z-10">
+                                <div className="flex items-center space-x-3">
+                                    <Zap className="h-6 w-6 text-yellow-500" />
+                                    <h1 className="text-xl font-bold text-gray-900">Global Chat Room</h1>
+                                </div>
+                                <div className="flex items-center space-x-3">
+                                    <span className={`text-sm font-medium ${isConnected ? 'text-green-600' : 'text-red-500'}`}>
+                                        {isConnected ? 'Online' : 'Connecting...'}
+                                    </span>
+                                    <Wifi className={`h-5 w-5 ${isConnected ? 'text-green-500' : 'text-red-400'}`} />
+                                    <div className="text-sm font-medium text-gray-700 bg-blue-100 px-3 py-1 rounded-full shadow-inner">
+                                        <span className="text-blue-600">You:</span> {username}
+                                    </div>
+                                </div>
+                            </header>
+
+                            {/* Message Display Area */}
+                            <main className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50">
+                                {isLoadingHistory ? (
+                                    <div className="flex justify-center items-center h-full">
+                                        <RotateCw className='w-6 h-6 animate-spin text-blue-500 mr-2'/>
+                                        <span className="text-lg text-gray-600">Loading chat history...</span>
+                                    </div>
+                                ) : (
+                                    messages.map((message) => (
+                                        <MessageBubble 
+                                            key={message.id || generateId()} 
+                                            message={message} 
+                                            isSelf={message.user === username} 
+                                        />
+                                    ))
+                                )}
+                                <div ref={messagesEndRef} />
+                            </main>
+
+                            {/* Message Input Form */}
+                            <footer className="p-4 border-t border-gray-200 bg-white sticky bottom-0">
+                                <form className="flex items-center space-x-3" onSubmit={handleSendMessage}>
+                                    <input
+                                        type="text"
+                                        value={inputMessage}
+                                        onChange={(e) => setInputMessage(e.target.value)}
+                                        placeholder={isConnected ? "Type your message here..." : "Connecting to server..."}
+                                        className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition duration-150 text-sm"
+                                        disabled={!isConnected || !isAuthenticated || isLoadingHistory}
+                                    />
+                                    <button
+                                        type="submit"
+                                        className="p-3 bg-blue-600 text-white rounded-lg shadow-lg hover:bg-blue-700 transition duration-150 ease-in-out disabled:opacity-50 flex items-center justify-center"
+                                        disabled={!isConnected || !inputMessage.trim() || isLoadingHistory}
+                                        aria-label="Send Message"
+                                    >
+                                        <Send className="h-5 w-5" />
+                                    </button>
+                                </form>
+                            </footer>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // Render the application
+        const rootElement = document.getElementById('root');
+        if (rootElement && ReactDOM.createRoot) {
+            ReactDOM.createRoot(rootElement).render(<App />);
+        } else {
+            console.error("Failed to find the root element or ReactDOM.createRoot is unavailable.");
+        }
+    </script>
+</body>
+</html>

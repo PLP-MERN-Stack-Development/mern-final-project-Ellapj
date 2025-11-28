@@ -1,0 +1,19 @@
+/* Mandatory Tailwind directives */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom font setup (Inter is a great default) */
+@layer base {
+  html {
+    font-family: 'Inter', sans-serif;
+  }
+}
+
+/* Ensure the root element fills the viewport */
+#root {
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start; /* Start from the top for better scrolling experience */
+}

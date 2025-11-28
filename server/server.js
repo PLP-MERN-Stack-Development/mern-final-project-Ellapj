@@ -1,132 +1,59 @@
-// server.js - Main server file for Socket.io chat application
+import express from 'express';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
 
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
+// --- Configuration ---
+const PORT = process.env.PORT || 3001;
+// FIX: Update the client origin to the actual Vite port
+const CLIENT_ORIGIN = 'http://localhost:5173'; 
 
-// Load environment variables
-dotenv.config();
-
-// Initialize Express app
+// --- 1. Set up Express App and HTTP Server ---
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+// Allow the React client to connect
+app.use(cors({
+    origin: CLIENT_ORIGIN, 
     methods: ['GET', 'POST'],
-    credentials: true,
-  },
-});
+    credentials: true
+}));
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+const httpServer = createServer(app);
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
-
-// Socket.io connection handler
-io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
-
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
-  });
-
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
+// --- 2. Configure Socket.io on the Server Side ---
+const io = new Server(httpServer, {
+    cors: {
+        origin: CLIENT_ORIGIN,
+        methods: ['GET', 'POST'],
+        credentials: true
     }
-    
-    io.emit('receive_message', message);
-  });
-
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
-    }
-  });
-
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
-    };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
-  });
-
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
-    }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
-  });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
-});
-
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
-});
-
-// Root route
+// --- Basic Express route check (optional) ---
 app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
+    res.send('Server is running and waiting for Socket.io connections.');
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// --- 3. Establish a Basic Connection (Socket.io Logic) ---
+
+// Listen for new client connections
+io.on('connection', (socket) => {
+    console.log(`[Server] User connected: ${socket.id}`);
+
+    // Listen for a test message from the client
+    socket.on('hello_from_client', (data) => {
+        console.log(`[Server] Received message: ${data.message}`);
+        
+        // Respond back to the specific client
+        socket.emit('hello_from_server', { message: 'Hello back! Connection acknowledged.' });
+    });
+
+    // Listen for client disconnection
+    socket.on('disconnect', () => {
+        console.log(`[Server] User disconnected: ${socket.id}`);
+    });
 });
 
-module.exports = { app, server, io }; 
+// --- Start the Server ---
+httpServer.listen(PORT, () => {
+    console.log(`🚀 Server listening on port ${PORT}`);
+});
